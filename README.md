@@ -1,79 +1,81 @@
-# s2ph_3D update bundle
+# s2ph_3D update package
 
-Drop these files into your local `s2ph_3D/` folder (overwriting the existing
-copies) and commit. Suggested commit message below.
+Drop these files into your `s2ph_3D` folder on the git machine, overwriting
+the existing copies (or `git add -A` / commit as usual).
 
-## What changed
+## Files in this package
 
-**`Anandlyn_log.py`**
+- `Anandlyn_log.py` — **updated**
+- `test_world3d_pygimli.py` — **updated**
+- `test_cylinder3d_pygimli.py` — unchanged (included for convenience)
+- `diag_world3d_geometry.py` — unchanged (included for convenience)
+- `visualize_world3d.py` — unchanged (included for convenience)
 
-- `_build_geometry_3d` / `_parse_all_3d` now delegate to a new
-  `_build_mesh_3d_gmsh`, which replaces the old pyGIMLi `mergePLC`-based 3D
-  mesh construction with an exact boolean CSG build via gmsh's OCC kernel
-  (`occ.addBox` / `occ.addCylinder` / `occ.fragment`). This gives exact,
-  conformal boundaries between layer slabs and `CylinderAnom` bodies, even
-  when a cylinder crosses a layer boundary at a shallow angle — the old
-  approach could crash TetGet or silently miscount there.
-  - Electrode positions are fragmented into the CSG *together* with the
-    box/cylinder solids (as 0D tool entities in the same `occ.fragment`
-    call), not embedded afterwards via a separate `mesh.embed()` call. The
-    latter was tried first and turned out to make gmsh's 3D tet
-    reconstruction silently drop an entire volume near the electrodes (no
-    exception — just a swallowed "No elements in volume N" warning),
-    which showed up downstream as pyGIMLi's
-    `"There is a requested electrode that does not match the given mesh."`
-    Fragmenting the points in from the start avoids it entirely (verified:
-    0 warnings, every electrode lands on an exact mesh node, real forward
-    solve finite/positive, before *and* after `update()` moves the
-    geometry).
-  - Region markers are tracked in `self._region_markers`, mapping
-    `(layer_idx, cyl_idx)` → integer marker (`cyl_idx=None` for
-    background-only regions). These survive into the pyGIMLi mesh as
-    `mesh.cellMarkers()`.
-  - Requires `gmsh` (`pip install gmsh`); on Linux you may also need
-    `libglu1-mesa libgl1 libxft2 libxinerama1 libxcursor1 libxrandr2 libxi6`
-    at the OS level if `import gmsh` fails with a missing `.so`.
+## Changelog
 
-- New `show_mesh_interactive(cMap="Spectral_r", logScale=True)` on
-  `AnomalyWorld`: opens an interactive pyvista window for a 3D world with:
-  - a draggable clip-plane widget (grab/rotate it to slice into the model)
-  - one checkbox per region (left column) to show/hide each
-    `(layer, cylinder)` region independently — e.g. hide the layers to
-    isolate a shaft, or the reverse
-  - display-mode checkboxes (right column): **Mesh only** (wireframe),
-    **Transparent** (35% opacity surface), **Opaque** (default), plus an
-    independent **Show mesh** toggle that overlays cell edges on any mode
-  - falls back to the plain `show_mesh()` (`pg.show`) for a 2D world.
+### `Anandlyn_log.py`
 
-**`test_world3d_pygimli.py`**
+1. **`AnomalyWorld.invert_2d(...)`** (new method) — runs a standard
+   pyGIMLi `ERTManager` 2.5D inversion on the survey line's
+   forward-simulated data. Reuses `self.scheme` directly (the same
+   straight line already used for the 3D forward solve is exactly what
+   `ERTManager` expects — no separate 2D-only scheme needed). Defaults to
+   noisy synthetic data (3% relative error by default; inverting
+   noise-free data is unrealistically easy and doesn't test anything
+   meaningful about model recovery). Stores `mgr_2d` / `model_2d` /
+   `chi2_2d` / `rrms_2d` on the world and also returns `(mgr, model)`.
+   Lets a dataset generated on the TRUE 3D geometry (an oblique shaft
+   drifting off-line, real topography, etc.) be inverted the way field
+   data normally is — assuming no along-strike structure — so the
+   resulting image can be compared against the world's actual resistivity
+   distribution to quantify what the 2D/2.5D assumption costs when the
+   true structure isn't 2D. Includes the same flat-model sanity warning
+   used in the Acre field-data pipeline (fires if the inversion never
+   moves off the homogeneous starting guess).
 
-- Calls `world.show_mesh_interactive()` at the end of the run (after both
-  forward-solve checks pass) instead of just saving static PNGs, so you get
-  a live look at the final/perturbed geometry.
+2. **`show_mesh_interactive(...)`** — added a "Show electrodes" checkbox
+   (same column as the "Mesh only" / "Transparent" / "Opaque" / "Show
+   mesh" controls) that toggles black sphere markers at each electrode's
+   surface position. Positions are computed the same way they're placed
+   as exact mesh nodes in `_build_mesh_3d_gmsh`: x, y from
+   `scheme.sensorPositions()`, z pinned to the domain's top face
+   (`self.start[2]`). Independent of the clip plane and region/display
+   controls — electrodes sit on the survey datum, not inside any one
+   clipped region.
 
-**`test_cylinder3d_pygimli.py`, `diag_world3d_geometry.py`,
-`visualize_world3d.py`** — unchanged, included only so the folder is
-self-consistent; no need to overwrite if you haven't touched them locally.
+### `test_world3d_pygimli.py`
+
+- Added `plot_true_vs_2d_inversion(world, out_path)` — a side-by-side
+  plot: (left) the true resistivity cross-section near y=0, same
+  convention as the existing `plot_cross_section`; (right) the 2.5D
+  `ERTManager` inversion of the same line via `pg.show(world.mgr_2d.
+  paraDomain, world.model_2d, ...)`, titled with chi2/rrms.
+- `main()` now calls `world.invert_2d(noise=True, noise_level=3.0,
+  lam=20.0, cType=1)` after the existing forward-solve checks and saves
+  the comparison plot as `world3d_2d_inversion_vs_true.png`, before
+  opening the interactive pyvista viewer.
 
 ## Suggested commit message
 
 ```
-3D: exact gmsh CSG meshing + interactive pyvista viewer
+Add 2.5D ERTManager inversion of the survey line + electrode display toggle
 
-- Replace mergePLC-based 3D mesh build with gmsh OCC boolean CSG
-  (exact layer/cylinder boundaries, fixes TetGen crash on shallow
-  layer-crossing cylinders)
-- Fragment electrodes into the CSG directly instead of a post-hoc
-  mesh.embed() call (fixes silently-dropped near-surface volume /
-  "electrode does not match mesh" on real 3D worlds)
-- Add AnomalyWorld.show_mesh_interactive(): clip-plane, per-region
-  show/hide, mesh/transparent/opaque display modes
-- Wire the new viewer into test_world3d_pygimli.py
+- AnomalyWorld.invert_2d(): standard pyGIMLi 2.5D inversion of the
+  existing survey line's forward-simulated data, for comparing against
+  the true 3D geometry (model error from the 2D/2.5D assumption).
+- show_mesh_interactive(): on/off checkbox for electrode markers.
+- test_world3d_pygimli.py: exercises invert_2d() and saves a
+  true-vs-inverted comparison plot.
 ```
 
-## Before running on this machine
+## Verification
 
-1. `pip install gmsh pyvista` if not already present in this env.
-2. Run `test_cylinder3d_pygimli.py` first (cheap, isolates the
-   `CylinderAnom` block math).
-3. Then `test_world3d_pygimli.py` for the full check + interactive viewer.
+Both files were sandbox-tested (syntax-checked and run against a small
+synthetic 3D world) before being sent back to this machine: `invert_2d()`
+runs end-to-end with no exceptions and the electrode-coordinate
+computation is correct. The sandbox's pyGIMLi build has an unrelated,
+environment-specific zero-Jacobian bug that flattens every inversion run
+there, so inversion *quality* could only be verified on your machine, not
+in the sandbox — the flat-model warning is expected to fire there and
+should NOT fire on your machine if it's still working the way earlier
+Acre-script runs showed.
