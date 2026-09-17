@@ -1,52 +1,79 @@
-# s2ph-pipeline
+# s2ph_3D update bundle
 
-S2PH ERT inversion pipeline: config, forward models, sequential OED, CV stages, validation.
+Drop these files into your local `s2ph_3D/` folder (overwriting the existing
+copies) and commit. Suggested commit message below.
 
-## Dependencies
-- Python 3.10+
-- pyGIMLi 1.6.0
-- numpy, scipy, openpyxl, matplotlib, shapely
+## What changed
 
-## Environment
-Run in the `ERT_GUI` conda environment (pygimli_env for sequential modules).
+**`Anandlyn_log.py`**
 
-## Structure
+- `_build_geometry_3d` / `_parse_all_3d` now delegate to a new
+  `_build_mesh_3d_gmsh`, which replaces the old pyGIMLi `mergePLC`-based 3D
+  mesh construction with an exact boolean CSG build via gmsh's OCC kernel
+  (`occ.addBox` / `occ.addCylinder` / `occ.fragment`). This gives exact,
+  conformal boundaries between layer slabs and `CylinderAnom` bodies, even
+  when a cylinder crosses a layer boundary at a shallow angle — the old
+  approach could crash TetGet or silently miscount there.
+  - Electrode positions are fragmented into the CSG *together* with the
+    box/cylinder solids (as 0D tool entities in the same `occ.fragment`
+    call), not embedded afterwards via a separate `mesh.embed()` call. The
+    latter was tried first and turned out to make gmsh's 3D tet
+    reconstruction silently drop an entire volume near the electrodes (no
+    exception — just a swallowed "No elements in volume N" warning),
+    which showed up downstream as pyGIMLi's
+    `"There is a requested electrode that does not match the given mesh."`
+    Fragmenting the points in from the start avoids it entirely (verified:
+    0 warnings, every electrode lands on an exact mesh node, real forward
+    solve finite/positive, before *and* after `update()` moves the
+    geometry).
+  - Region markers are tracked in `self._region_markers`, mapping
+    `(layer_idx, cyl_idx)` → integer marker (`cyl_idx=None` for
+    background-only regions). These survive into the pyGIMLi mesh as
+    `mesh.cellMarkers()`.
+  - Requires `gmsh` (`pip install gmsh`); on Linux you may also need
+    `libglu1-mesa libgl1 libxft2 libxinerama1 libxcursor1 libxrandr2 libxi6`
+    at the OS level if `import gmsh` fails with a missing `.so`.
 
-### S2PH pipeline (Article 1)
-- `config.py` — single source of truth for geometry, noise, CV thresholds, paths
-- `pipelib.py` — checkpointing, manifests, validation gates
-- `stage1_forward.py` — build worlds, compute forward responses
-- `stage2_invert.py` — smooth L2 inversion + deterministic raster export
-- `stage3_cv.py` — CV segmentation sweep, component audit, initializer extraction
-- `run_cij_opti.py` — PWHG optimisation (ls_opti_cs DE optimizer)
-- `Anandlyn_log.py` — AnomalyWorld class (PWHG parameterization)
-- `ert_interpreter.py` — patched CV/segmentation GUI functions
+- New `show_mesh_interactive(cMap="Spectral_r", logScale=True)` on
+  `AnomalyWorld`: opens an interactive pyvista window for a 3D world with:
+  - a draggable clip-plane widget (grab/rotate it to slice into the model)
+  - one checkbox per region (left column) to show/hide each
+    `(layer, cylinder)` region independently — e.g. hide the layers to
+    isolate a shaft, or the reverse
+  - display-mode checkboxes (right column): **Mesh only** (wireframe),
+    **Transparent** (35% opacity surface), **Opaque** (default), plus an
+    independent **Show mesh** toggle that overlays cell edges on any mode
+  - falls back to the plain `show_mesh()` (`pg.show`) for a 2D world.
 
-### Sequential OED (Article 3)
-- `pwhg_wrapper.py` — forward, Jacobian, noise model, Fisher/posterior
-- `pwhg_forward_soft.py` — SoftTriForward (stateless, smooth sigmoid boundaries)
-- `seq_local_update.py` — GN/Laplace update with eigenvalue floor + containment
-- `seq_coldstart.py` — epsilon-consistent cold-start dataset generation
-- `seq_handoff.py` — CV seed → handoff state (theta_hat0, Sigma0)
-- `seq_greedy.py` — greedy D-optimal EIG acquisition loop
-- `seq_sweep.py` — characterize greedy loop across prior-drawn scenes
-- `seq_parallel.py` — process-parallel SoftTri forward/Jacobian
-- `seq_log.py` — logging
-- `seq_sentinel_softde.py`, `seq_sentinel_ls.py` — sentinel re-globalization
-- `seq_debias_compare.py` — SoftTri vs remesh polish comparison
-- `seq_scene_score.py` — Article 1 Q_scene metric for sequential results
-- `seq_radius_sweep.py` — controlled 1D radius-threshold experiment
-- `build_pool.py` — comprehensive candidate pool construction
-- `oed_linearized.py`, `oed_c1.py` — linearized OED gates
+**`test_world3d_pygimli.py`**
 
-### Validation / diagnostics
-- `validate_sensitivity.py` — deep check of PWHG sensitivity/Fisher
-- `validate_geometry.py` — geometry validation
-- `validate_soft.py` — soft forward validation
-- `check_base.py`, `check_cov.py`, `check_fix_rho.py`, `check_saturation.py`, `check_shape.py`, `check_jac_depth.py`, `check_par_vs_serial_jac.py`, `check_whit_true.py`
-- `compare_arrays.py`, `compare_forward_meshes.py`
-- `scene_metric.py` — sensitivity/contrast-weighted scene quality score
-- `wk_report.py` — w_k analysis for over-specified scenes
+- Calls `world.show_mesh_interactive()` at the end of the run (after both
+  forward-solve checks pass) instead of just saving static PNGs, so you get
+  a live look at the final/perturbed geometry.
 
-### Benchmarks
-- `bench_forward_cost.py`, `bench_parallel.py`, `bench_tri_area.py`
+**`test_cylinder3d_pygimli.py`, `diag_world3d_geometry.py`,
+`visualize_world3d.py`** — unchanged, included only so the folder is
+self-consistent; no need to overwrite if you haven't touched them locally.
+
+## Suggested commit message
+
+```
+3D: exact gmsh CSG meshing + interactive pyvista viewer
+
+- Replace mergePLC-based 3D mesh build with gmsh OCC boolean CSG
+  (exact layer/cylinder boundaries, fixes TetGen crash on shallow
+  layer-crossing cylinders)
+- Fragment electrodes into the CSG directly instead of a post-hoc
+  mesh.embed() call (fixes silently-dropped near-surface volume /
+  "electrode does not match mesh" on real 3D worlds)
+- Add AnomalyWorld.show_mesh_interactive(): clip-plane, per-region
+  show/hide, mesh/transparent/opaque display modes
+- Wire the new viewer into test_world3d_pygimli.py
+```
+
+## Before running on this machine
+
+1. `pip install gmsh pyvista` if not already present in this env.
+2. Run `test_cylinder3d_pygimli.py` first (cheap, isolates the
+   `CylinderAnom` block math).
+3. Then `test_world3d_pygimli.py` for the full check + interactive viewer.
