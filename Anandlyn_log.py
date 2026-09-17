@@ -10,6 +10,7 @@ from pygimli.physics import ert
 import scipy as sp
 from scipy.optimize import minimize, LinearConstraint, differential_evolution, NonlinearConstraint, shgo
 from shapely.geometry import Point, Polygon
+from shapely.affinity import scale as _shapely_scale, rotate as _shapely_rotate, translate as _shapely_translate
 import copy
 from IPython.display import display
 from scipy.stats import qmc
@@ -274,8 +275,85 @@ def assign_polygon_resistivities(mesh, polygons, resistivities, res_map):
                 res_map[cell_index] = res
     return res_map
 
+
+def assign_layer_resistivities_3d(mesh, layers_z, resistivities, default_resistivity=1e6):
+    """
+    3D counterpart of assign_layer_resistivities: horizontal (flat) slabs,
+    so a cell only needs its z coordinate checked, same as the 2D version
+    checks y. layers_z is a list of (z_top, z_bottom) pairs (z=0 is the
+    surface, more negative is deeper -- either order per pair is accepted),
+    matched 1:1 with resistivities.
+    """
+    if len(layers_z) != len(resistivities):
+        raise ValueError("Number of layers must match number of resistivity values.")
+
+    res_map = np.full(mesh.cellCount(), default_resistivity, dtype=float)
+    for (z_a, z_b), res in zip(layers_z, resistivities):
+        lo, hi = (z_a, z_b) if z_a <= z_b else (z_b, z_a)
+        for cell_index, cell in enumerate(mesh.cells()):
+            z = cell.center().z()
+            if lo <= z <= hi:
+                res_map[cell_index] = res
+    return res_map
+
+
+def _point_segment_distance(p, a, b):
+    """Distance from point p (shape (3,)) to the segment a-b (each (3,))."""
+    ab = b - a
+    denom = np.dot(ab, ab)
+    if denom < 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0)
+    closest = a + t * ab
+    return float(np.linalg.norm(p - closest))
+
+
+def assign_cylinder_resistivities(mesh, cylinders, resistivities, res_map):
+    """
+    3D counterpart of assign_polygon_resistivities, for CylinderAnom
+    bodies. `cylinders` is a list of (x1,y1,z1,x2,y2,z2,r) tuples. A cell
+    is assigned the cylinder's rho if its center is within r of the
+    START-END SEGMENT (a capsule, not an infinite cylinder) -- for a body
+    much longer than it is wide (a shaft, a beam) this only rounds the two
+    end caps slightly instead of leaving them flat, which is a minor and
+    usually harmless over-inclusion right at the ends.
+    """
+    if len(cylinders) != len(resistivities):
+        raise ValueError("Number of cylinders must match number of resistivity values.")
+
+    cell_centers = [np.array([c.center().x(), c.center().y(), c.center().z()])
+                    for c in mesh.cells()]
+
+    for (x1, y1, z1, x2, y2, z2, r), res in zip(cylinders, resistivities):
+        a = np.array([x1, y1, z1], dtype=float)
+        b = np.array([x2, y2, z2], dtype=float)
+        for cell_index, p in enumerate(cell_centers):
+            if _point_segment_distance(p, a, b) <= r:
+                res_map[cell_index] = res
+    return res_map
+
+
 # import pybert as pb
 class CircleAnom:
+    # Ordered decision-variable names, in the exact order varflag/varlims/get_x0/
+    # get_bounds/update expect them. AnomalyWorld and Constraints read this
+    # instead of hardcoding indices, so a new anomaly shape (e.g. an ellipse
+    # cross-section) only needs to define its own param_names/log_flags/
+    # containment_vars -- no changes to AnomalyWorld or Constraints.
+    param_names = ['x', 'y', 'r', 'rho']
+    # Which params act as a "half-extent" for the automatic World-containment
+    # constraints (generate_auto_constraints): for a circle, r is the exact
+    # half-extent in both x and y.
+    containment_vars = ['r']
+
+    @property
+    def log_flags(self):
+        # Per-instance (self.log_r / self.log_rho control the actual
+        # transform in get_x0/update/get_bounds today), exposed by name so
+        # AnomalyWorld/Constraints can look it up generically instead of
+        # hardcoding "index 2 -> log_r, index 3 -> log_rho".
+        return {'x': False, 'y': False, 'r': self.log_r, 'rho': self.log_rho}
+
     def __init__(self, name, x=0, y=0, r=1.0, rho=1.0, _c_num=1, _varflag=None, _varlims=None,_log_rho=True,_log_r=True):
         if _varflag is None:
             _varflag = [False] * 4
@@ -334,7 +412,258 @@ class CircleAnom:
         self.polygon = self.center.buffer(self.r)
 
 
+class EllipseAnom:
+    """
+    Elliptical cross-section anomaly -- a sibling of CircleAnom for shapes a
+    circle can't represent, e.g. an oblique mine shaft whose visible
+    cross-section in the 2D measurement plane is elongated rather than
+    round (Case 1 of the field-demonstrations project), or an
+    archaeological wall/bridge modelled as a thin elongated body (Case 2).
+
+    Parameters, in optimizer order: x, y (center), a, b (semi-axes in the
+    ellipse's own frame, before rotation), theta (rotation, degrees,
+    counter-clockwise from the x-axis), rho. A circle is the special case
+    a == b (theta then has no effect on the shape, only on its varlims).
+    """
+    param_names = ['x', 'y', 'a', 'b', 'theta', 'rho']
+    # Both semi-axes act as "half-extent" params for the automatic
+    # World-containment constraint (see Constraints.generate_auto_constraints).
+    # With theta free, the true worst-case footprint in x (or y) across all
+    # rotations is max(a, b); enforcing x+a<=end_x together with x+b<=end_x
+    # is exactly x+max(a,b)<=end_x -- sound but conservative versus the true
+    # rotation-dependent footprint, since it does not use theta.
+    containment_vars = ['a', 'b']
+
+    @property
+    def log_flags(self):
+        return {'x': False, 'y': False, 'a': self.log_a, 'b': self.log_b,
+                'theta': False, 'rho': self.log_rho}
+
+    def __init__(self, name, x=0, y=0, a=1.0, b=0.5, theta=0.0, rho=1.0,
+                 _c_num=1, _varflag=None, _varlims=None,
+                 _log_rho=True, _log_a=True, _log_b=True, _resolution=64):
+        if _varflag is None:
+            _varflag = [False] * 6
+        else:
+            if _varlims is None:
+                _varlims = []
+                for i, vf in enumerate(_varflag):
+                    if vf:
+                        # x, y, theta unbounded by default (like CircleAnom's
+                        # x/y); a, b default to a >=0 lower bound.
+                        lower = -np.inf if i in (0, 1, 4) else 0.0
+                        _varlims.append((lower, np.inf))
+        self.name = name
+        self.x = x
+        self.y = y
+        self.a = a
+        self.b = b
+        self.theta = theta
+        self.rho = rho
+        self.log_rho = _log_rho
+        self.log_a = _log_a
+        self.log_b = _log_b
+        self.varflag = _varflag
+        self.varlims = _varlims
+        self.marker = _c_num + 1
+        self.resolution = _resolution
+        self.center = Point(self.x, self.y)
+        self.polygon = self._build_polygon()
+        self.block = self._build_block(area=0.01)
+
+    def _build_polygon(self):
+        base = Point(0, 0).buffer(1, resolution=self.resolution)
+        ell = _shapely_scale(base, xfact=self.a, yfact=self.b, origin=(0, 0))
+        ell = _shapely_rotate(ell, self.theta, origin=(0, 0), use_radians=False)
+        ell = _shapely_translate(ell, xoff=self.x, yoff=self.y)
+        return ell
+
+    def _build_block(self, area=0.1):
+        # Vertices come straight from the same shapely polygon used for
+        # resistivity assignment, so the mesh block and the "is this cell
+        # inside the anomaly" test can never disagree on the shape.
+        verts = list(self.polygon.exterior.coords)[:-1]  # drop closing dup
+        return mt.createPolygon(verts, isClosed=True, marker=self.marker,
+                                boundaryMarker=10, area=area, isHole=False)
+
+    def __str__(self):
+        return (f"{self.name}- x: {self.x}, y: {self.y}, a: {self.a}, "
+                f"b: {self.b}, theta: {self.theta}, rho: {self.rho}")
+
+    def show(self):
+        pg.show(self.block)
+
+    def update(self, name, x, y, a, b, theta, rho, _c_num, _varflag=None, _varlims=None):
+        if _varflag is None:
+            _varflag = [False] * 6
+        else:
+            if _varlims is None:
+                _varlims = []
+                for i, vf in enumerate(_varflag):
+                    if vf:
+                        lower = -np.inf if i in (0, 1, 4) else 0.0
+                        _varlims.append((lower, np.inf))
+        self.name = name
+        self.x = x
+        self.y = y
+        self.a = a
+        self.b = b
+        self.theta = theta
+        self.rho = rho
+        self.varflag = _varflag
+        self.varlims = _varlims
+        self.marker = _c_num + 1
+        self.center = Point(self.x, self.y)
+        self.polygon = self._build_polygon()
+        self.block = self._build_block(area=0.1)
+
+    def update_block(self):
+        self.block = self._build_block(area=0.1)
+        self.center = Point(self.x, self.y)
+        self.polygon = self._build_polygon()
+
+
+class CylinderAnom:
+    """
+    3D cylindrical anomaly for a single-survey-line 3D forward model (see
+    AnomalyWorld's 3D path, active when start/end are 3-tuples): a tunnel,
+    shaft, or elongated metallic body, parameterized directly by its two
+    end points and a radius, as a "faithful sibling" of CircleAnom/
+    EllipseAnom for the case where the target is a genuinely 3D body rather
+    than a 2D cross-section (Case 1's oblique mine shaft, running out of
+    the measurement plane).
+
+    Parameters, in optimizer order: x1,y1,z1 (start point), x2,y2,z2 (end
+    point), r, rho. Convention: z=0 is the surface, more negative z is
+    deeper (matches Layer.y / the 2D primitives' 'y' in AnomalyWorld's
+    depth axis).
+
+    Containment: `anchor_points` lists BOTH end points, so
+    Constraints.generate_auto_constraints bounds each of them (x,y,z)
+    independently inside the world box, inflated by r on every axis -- an
+    axis-aligned capsule bound. This is sound but conservative: it ignores
+    that the cylinder's actual footprint along, say, x depends on its
+    orientation, exactly like the ellipse's (a,b) bound ignores theta.
+
+    NOTE ON pyGIMLi 3D API: `_build_block()` uses pyGIMLi's
+    meshtools.createCylinder() (built along the local z-axis, centered at
+    the origin) and then rotates/translates it onto (x1,y1,z1)->(x2,y2,z2).
+    This was written and syntax-checked WITHOUT a local pyGIMLi install (not
+    available in the environment this was developed in) -- verify it with
+    the accompanying test_cylinder3d_pygimli.py before relying on it; the
+    exact rotate()/translate() call signature can differ across pyGIMLi
+    versions.
+    """
+    param_names = ['x1', 'y1', 'z1', 'x2', 'y2', 'z2', 'r', 'rho']
+    containment_vars = ['r']
+    anchor_points = [('x1', 'y1', 'z1'), ('x2', 'y2', 'z2')]
+
+    @property
+    def log_flags(self):
+        return {'x1': False, 'y1': False, 'z1': False,
+                'x2': False, 'y2': False, 'z2': False,
+                'r': self.log_r, 'rho': self.log_rho}
+
+    def __init__(self, name, x1=0.0, y1=0.0, z1=0.0, x2=1.0, y2=0.0, z2=-1.0,
+                 r=0.5, rho=1.0, _c_num=1, _varflag=None, _varlims=None,
+                 _log_rho=True, _log_r=True, _n_segments=16):
+        if _varflag is None:
+            _varflag = [False] * 8
+        else:
+            if _varlims is None:
+                _varlims = []
+                for i, vf in enumerate(_varflag):
+                    if vf:
+                        # r (index 6) is bounded below at 0; every position
+                        # component (the six endpoint coordinates) and rho
+                        # default to unbounded, same convention as
+                        # CircleAnom/EllipseAnom.
+                        lower = 0.0 if i == 6 else -np.inf
+                        _varlims.append((lower, np.inf))
+        self.name = name
+        self.x1, self.y1, self.z1 = x1, y1, z1
+        self.x2, self.y2, self.z2 = x2, y2, z2
+        self.r = r
+        self.rho = rho
+        self.log_rho = _log_rho
+        self.log_r = _log_r
+        self.varflag = _varflag
+        self.varlims = _varlims
+        self.marker = _c_num + 1
+        self.n_segments = _n_segments
+        self.block = self._build_block()
+
+    def _axis_vectors(self):
+        a = np.array([self.x1, self.y1, self.z1], dtype=float)
+        b = np.array([self.x2, self.y2, self.z2], dtype=float)
+        return a, b
+
+    def _build_block(self, area=0.1):
+        a, b = self._axis_vectors()
+        d = b - a
+        height = float(np.linalg.norm(d))
+        if height < 1e-9:
+            raise ValueError(f"{self.name}: start and end points coincide "
+                              f"(zero-length cylinder) -- a and b must differ.")
+        cyl = mt.createCylinder(radius=self.r, height=height, nSegments=self.n_segments,
+                                marker=self.marker, boundaryMarker=10, area=area, isHole=False)
+        axis = d / height
+        z_hat = np.array([0.0, 0.0, 1.0])
+        dot = float(np.clip(np.dot(z_hat, axis), -1.0, 1.0))
+        rot_axis = np.cross(z_hat, axis)
+        rot_axis_norm = np.linalg.norm(rot_axis)
+        if rot_axis_norm > 1e-9:
+            angle = np.arccos(dot)  # radians
+            # pg's rotate() takes a rotation VECTOR (unit axis * angle); if
+            # your pygimli expects rotate(axis, angle) instead, split this
+            # into that call -- see test_cylinder3d_pygimli.py.
+            cyl.rotate(pg.core.RVector3(*(rot_axis / rot_axis_norm * angle)))
+        elif dot < 0:
+            # axis anti-parallel to z (straight down): 180 deg flip around x.
+            cyl.rotate(pg.core.RVector3(np.pi, 0.0, 0.0))
+        midpoint = (a + b) / 2.0
+        cyl.translate(pg.core.RVector3(*midpoint))
+        return cyl
+
+    def update_block(self):
+        self.block = self._build_block()
+
+    def __str__(self):
+        return (f"{self.name}- ({self.x1:.2f},{self.y1:.2f},{self.z1:.2f}) -> "
+                f"({self.x2:.2f},{self.y2:.2f},{self.z2:.2f}), r: {self.r}, rho: {self.rho}")
+
+    def show(self):
+        pg.show(self.block)
+
+    def update(self, name, x1, y1, z1, x2, y2, z2, r, rho, _c_num,
+               _varflag=None, _varlims=None):
+        if _varflag is None:
+            _varflag = [False] * 8
+        else:
+            if _varlims is None:
+                _varlims = []
+                for i, vf in enumerate(_varflag):
+                    if vf:
+                        lower = 0.0 if i == 6 else -np.inf
+                        _varlims.append((lower, np.inf))
+        self.name = name
+        self.x1, self.y1, self.z1 = x1, y1, z1
+        self.x2, self.y2, self.z2 = x2, y2, z2
+        self.r = r
+        self.rho = rho
+        self.varflag = _varflag
+        self.varlims = _varlims
+        self.marker = _c_num + 1
+        self.block = self._build_block()
+
+
 class Layer:
+    param_names = ['y', 'rho']
+
+    @property
+    def log_flags(self):
+        return {'y': False, 'rho': self.log_rho}
+
     def __init__(self, name, y=0, rho=1.0, _cnum=1, _varflag=None, _varlims=None,_log_rho=True):
         if _varflag is None:
             _varflag = [False] * 2
@@ -461,7 +790,8 @@ class Constraints:
         # Process layers
         for layer in layers:
             if hasattr(layer, 'varflag'):
-                for attr, flag in zip(['y', 'rho'], layer.varflag):
+                names = getattr(layer, 'param_names', ['y', 'rho'])
+                for attr, flag in zip(names, layer.varflag):
                     value = getattr(layer, attr)
                     if flag:  # varflag = 1
                         variable_map[(layer.name, attr)] = variable_idx
@@ -470,10 +800,13 @@ class Constraints:
                         parameter_map[(layer.name, attr)] = (parameter_idx, value)
                         parameter_idx += 1
 
-        # Process anomalies
+        # Process anomalies. `param_names` lets each anomaly shape (circle,
+        # ellipse, ...) declare its own ordered parameter list instead of the
+        # loop assuming exactly ['x', 'y', 'r', 'rho'].
         for anomaly in anomalies:
             if hasattr(anomaly, 'varflag'):
-                for attr, flag in zip(['x', 'y', 'r', 'rho'], anomaly.varflag):
+                names = getattr(anomaly, 'param_names', ['x', 'y', 'r', 'rho'])
+                for attr, flag in zip(names, anomaly.varflag):
                     value = getattr(anomaly, attr)
                     if flag:  # varflag = 1
                         variable_map[(anomaly.name, attr)] = variable_idx
@@ -498,35 +831,64 @@ class Constraints:
             :param _end:
             :param _start:
         """
+        # The LAST coordinate axis is always the depth-like one: start=top
+        # (0 in this project's convention), end=bottom (more negative =
+        # deeper), so its containment bound is asymmetric (swapped
+        # start/end) exactly like the 2D primitives' 'y' always was. Every
+        # other axis (2D's 'x'; 3D's 'x' and the new cross-line 'y') is a
+        # plain symmetric [start, end] bound. This one rule is what lets the
+        # same code serve the 2D world (start=[x,y]) and the 3D world
+        # (start=[x,y,z]) without a separate 3D branch.
+        depth_axis = len(_start) - 1
+
         for i, layer in enumerate(layers):
             if hasattr(layer, 'varflag') and hasattr(layer, 'varlims'):
-                # # NATURAL BOUNDS # it is covered in the bounds vectors in the opt method, so it is deactivated for
-                # the constraints j = 0 # for variable bounds read for i, attr in enumerate(['y', 'rho']): flag =
-                # layer.varflag[i] if flag: lower, upper = layer.varlims[j] j += 1 if not np.isnan(lower) and not
-                # np.isnan(upper): self.add_constraint(layer, attr, 'bounds', param_value1=lower, param_value2=upper)
-                # BENEATH TOP print("j,i=",j,i) # to delete
                 if i == 0:
-                    self.add_constraint(entity1=layer, var1='y', constraint_type='<=', param_value1=_start[1] - 0.01)
+                    self.add_constraint(entity1=layer, var1='y', constraint_type='<=',
+                                        param_value1=_start[depth_axis] - 0.01)
                 if i > 0:
                     self.add_constraint(entity1=layer, var1='y', entity2=layers[i - 1], var2='y',
                                         constraint_type='<=', param_value1=-0.01)
         for anomaly in anomalies:
             if hasattr(anomaly, 'varflag') and hasattr(anomaly, 'varlims'):
-                # World limits
-                # X limits
-                if anomaly.varflag[0] or anomaly.varflag[2]:
-                    # x+r<=end_x
-                    self.add_constraint(anomaly, var1='x', entity2=anomaly, var2='r', constraint_type='sum_bounds',
-                                        param_value1=_start[0], param_value2=_end[0])
-                    self.add_constraint(anomaly, var1='x', entity2=anomaly, var2='r', constraint_type='>=',
-                                        param_value1=_start[0])
-                # Y limits
-                if anomaly.varflag[1] or anomaly.varflag[2]:
-                    self.add_constraint(anomaly, var1='y', entity2=anomaly, var2='r', constraint_type='sum_bounds',
-                                        param_value1=_end[1], param_value2=_start[1])
-                    self.add_constraint(anomaly, var1='y', entity2=anomaly, var2='r', constraint_type='>=',
-                                        param_value1=_end[1])
-                    pass
+                # World limits.
+                # `containment_vars` is the anomaly's list of "half-extent"
+                # params (a circle: ['r']; an ellipse: ['a', 'b']; a
+                # cylinder: ['r'] applied at both endpoints via
+                # `anchor_points`). With a free rotation/orientation the
+                # worst-case footprint along any one axis is
+                # max(containment_vars), and enforcing e.g. x+a<=end_x
+                # together with x+b<=end_x is exactly x+max(a,b)<=end_x --
+                # sound but conservative, and doesn't need to know the
+                # orientation (theta, or the cylinder's own axis direction).
+                #
+                # `anchor_points` is a list of coordinate-name tuples, one
+                # per point on the anomaly that must stay in the box: a
+                # circle/ellipse has one anchor [('x','y')]; a cylinder has
+                # two, one per end point, e.g.
+                # [('x1','y1','z1'), ('x2','y2','z2')].
+                names = getattr(anomaly, 'param_names', ['x', 'y', 'r', 'rho'])
+                idx = {n: k for k, n in enumerate(names)}
+                containment_vars = getattr(anomaly, 'containment_vars', ['r'])
+                extent_free = any(anomaly.varflag[idx[v]] for v in containment_vars if v in idx)
+                anchor_points = getattr(anomaly, 'anchor_points', [('x', 'y')])
+                for anchor in anchor_points:
+                    for axis_i, vname in enumerate(anchor):
+                        if vname is None or vname not in idx:
+                            continue
+                        v_free = anomaly.varflag[idx[vname]]
+                        if not (v_free or extent_free):
+                            continue
+                        depth_like = (axis_i == depth_axis)
+                        lo = _end[axis_i] if depth_like else _start[axis_i]
+                        hi = _start[axis_i] if depth_like else _end[axis_i]
+                        for cvar in containment_vars:
+                            # lo <= v+cvar <= hi   and   v-cvar >= lo
+                            self.add_constraint(anomaly, var1=vname, entity2=anomaly, var2=cvar,
+                                                constraint_type='sum_bounds',
+                                                param_value1=lo, param_value2=hi)
+                            self.add_constraint(anomaly, var1=vname, entity2=anomaly, var2=cvar,
+                                                constraint_type='>=', param_value1=lo)
 
     def __str__(self):
         """
@@ -727,9 +1089,11 @@ class World:
 class AnomalyWorld:
     def __init__(self, _start, _end, _scheme, _rho_world=1e6, _rho_world_varflag=False, _rho_world_varlim=None,
                  meas=None, _layers=None,
-                 _circles=None):
+                 _circles=None, _cylinders=None):
         if _circles is None:
             _circles = []
+        if _cylinders is None:
+            _cylinders = []
         if _layers is None:
             _layers = []
         if _rho_world_varlim is None:
@@ -742,17 +1106,25 @@ class AnomalyWorld:
         self.end = _end
         self.layers = _layers
         self.Circles = _circles
+        # `Cylinders` (3D anomalies) and `Circles` (2D anomalies) are
+        # mutually exclusive in practice: is_3d picks the geometry-building
+        # path (2D circles/ellipses in a 2D world, or 3D cylinders in a 3D
+        # box), but for the decision-variable machinery (get_x0/get_bounds/
+        # update/constraints) both lists are just treated as "anomalies" --
+        # see self._anomalies below.
+        self.Cylinders = _cylinders
+        self.is_3d = len(self.start) == 3
         self.rho_world = _rho_world
         self.rho_world_varflag = _rho_world_varflag
         self.rho_world_varlim = _rho_world_varlim
         self.constraint_group = Constraints()
-        self._last_circles_state = [(c.x, c.y, c.r) for c in self.Circles]
+        self._last_circles_state = [self._geometry_key(c) for c in self._anomalies()]
         self._last_layers_state  = [(l.y) for l in self.layers]
-        self.constraint_group.generate_auto_constraints(self.layers, self.Circles, self.start, self.end)
+        self.constraint_group.generate_auto_constraints(self.layers, self._anomalies(), self.start, self.end)
         (self.variable_map,
          self.parameter_map,
          self.num_variables,
-         self.num_parameters) = self.constraint_group.generate_variable_map(self.layers, self.Circles,
+         self.num_parameters) = self.constraint_group.generate_variable_map(self.layers, self._anomalies(),
                                                                             self.rho_world_varflag, self.rho_world)
 
         a, lb, ub = self.constraint_group.evaluate_constraints(self.variable_map, self.parameter_map,
@@ -763,15 +1135,207 @@ class AnomalyWorld:
         else:
             self.constraints = None
         for i, layer in enumerate(self.layers):
-            layer.update(name=layer.name, y=layer.y, rho=layer.rho, cnum=i + 1, _varflag=layer.varflag,
-                         _varlims=layer.varlims)
+            kwargs = {n: getattr(layer, n) for n in self._entity_param_names(layer, ['y', 'rho'])}
+            layer.update(name=layer.name, cnum=i + 1, _varflag=layer.varflag,
+                         _varlims=layer.varlims, **kwargs)
+
+        self.meas = meas
+        self.fop = ert.ERTModelling()
+        if self.is_3d:
+            self._build_geometry_3d()
+        else:
+            self._build_geometry_2d()
+        self.n_fev = 0
+        self.best_male = np.inf
+        self.best_msle = np.inf
+        self.best_x_male = None
+        self.best_x_msle = None
+        self.history = {
+            'fevals': [],
+            'best_male': [],
+            'best_msle': []
+        }
+        
+        self._fev_display = display("", display_id=True)
+
+    def _anomalies(self):
+        """
+        Combined anomaly list for the decision-variable machinery
+        (get_x0/get_bounds/update/get_varflag_n/constraints), which only
+        cares about param_names/log_flags/varflag/varlims and doesn't need
+        to know whether an entry is a 2D CircleAnom/EllipseAnom or a 3D
+        CylinderAnom. Circles and Cylinders are otherwise built/meshed by
+        entirely different code paths (_build_geometry_2d/_build_geometry_3d),
+        selected by self.is_3d; in practice only one of the two lists is
+        non-empty for a given world.
+        """
+        return self.Circles + self.Cylinders
+
+    def _geometry_state(self):
+        layer_state = tuple(layer.y for layer in self.layers)
+        circle_state = tuple(self._geometry_key(c) for c in self._anomalies())
+        return layer_state, circle_state
+
+    def show_mesh(self):
+        pg.show(self.mesh, data=self.resistivity_map)
+
+    def show_mesh_interactive(self, cMap="Spectral_r", logScale=True):
+        """
+        Interactive pyvista view of the model: a draggable clip-plane
+        widget to slice through it, plus one checkbox per region (each
+        (layer, cylinder) combination from self._region_markers -- see
+        _build_mesh_3d_gmsh) to show/hide that region independently, e.g.
+        hide the layer(s) to isolate a cylinder, or the reverse. Dragging
+        the plane re-clips whichever regions are currently checked on.
+
+        3D (gmsh-built) worlds only -- falls back to the plain show_mesh()
+        for a 2D world, where there's no self._region_markers/cellMarkers
+        split to check-box and no volume to clip through.
+        """
+        if not self.is_3d or not hasattr(self, '_region_markers'):
+            self.show_mesh()
+            return
+
+        import pyvista as pv
+        import pygimli.viewer.pv as pgpv
+
+        rho = np.asarray(self.resistivity_map, dtype=float)
+        label = "Resistivity (Ohm.m)"
+        full = pgpv.pgMesh2pvMesh(self.mesh, data=rho, label=label)
+        cell_markers = np.asarray(self.mesh.cellMarkers())
+        cmin, cmax = float(np.nanmin(rho)), float(np.nanmax(rho))
+
+        inv = {mk: key for key, mk in self._region_markers.items()}
+
+        def _region_name(mk):
+            key = inv.get(int(mk))
+            if key is None:
+                return f"region {int(mk)}"
+            layer_idx, cyl_idx = key
+            name = f"layer {layer_idx}"
+            if cyl_idx is not None:
+                cyl = self.Cylinders[cyl_idx] if cyl_idx < len(self.Cylinders) else None
+                name += f" + {cyl.name if cyl is not None else f'cyl{cyl_idx}'}"
+            return name
+
+        markers = sorted(int(m) for m in np.unique(cell_markers))
+        region_grids = {mk: full.extract_cells(np.where(cell_markers == mk)[0])
+                        for mk in markers}
+        region_visible = {mk: True for mk in markers}
+        region_actors = {}
+        # style: 'surface' (opaque/transparent) or 'wireframe' ("mesh only");
+        # opacity only matters for style='surface'; show_edges overlays the
+        # cell edges on top of either style (harmless/no-op on wireframe).
+        state = {"normal": [1.0, 0.0, 0.0], "origin": list(full.center),
+                 "style": "surface", "opacity": 1.0, "show_edges": False}
+
+        plotter = pv.Plotter()
+        plotter.set_background("white")
+
+        def _rebuild():
+            for mk in markers:
+                if mk in region_actors:
+                    plotter.remove_actor(region_actors[mk], render=False)
+                    del region_actors[mk]
+                if not region_visible[mk]:
+                    continue
+                clipped = region_grids[mk].clip(normal=state["normal"], origin=state["origin"])
+                region_actors[mk] = plotter.add_mesh(
+                    clipped, scalars=label, cmap=cMap, log_scale=logScale,
+                    clim=[cmin, cmax], show_scalar_bar=(mk == markers[0]),
+                    name=f"region_{mk}", style=state["style"],
+                    opacity=state["opacity"], show_edges=state["show_edges"])
+            plotter.render()
+
+        def _on_plane(normal, origin):
+            state["normal"] = list(normal)
+            state["origin"] = list(origin)
+            _rebuild()
+
+        plotter.add_plane_widget(_on_plane, normal=state["normal"], origin=state["origin"])
+
+        y = 10
+        for mk in markers:
+            def _make_cb(mk=mk):
+                def _cb(flag):
+                    region_visible[mk] = flag
+                    _rebuild()
+                return _cb
+            plotter.add_checkbox_button_widget(_make_cb(), value=True, position=(10, y), size=24)
+            plotter.add_text(_region_name(mk), position=(42, y), font_size=10)
+            y += 32
+
+        # Display-mode controls, in a second column so they don't collide
+        # with the per-region checkboxes above. "Mesh only"/"Transparent"/
+        # "Opaque" act as mode-select buttons (clicking one applies that
+        # mode outright, regardless of the checkbox's own new state) rather
+        # than a true mutually-exclusive radio group -- pyvista has no
+        # built-in radio widget, and this keeps the callback logic simple.
+        # "Show mesh" is an independent on/off toggle for cell-edge overlay,
+        # combinable with any of the three modes above.
+        col2_x = 280
+        y2 = 10
+
+        def _set_mode(style, opacity):
+            def _cb(_flag):
+                state["style"] = style
+                state["opacity"] = opacity
+                _rebuild()
+            return _cb
+
+        plotter.add_checkbox_button_widget(_set_mode("wireframe", 1.0), value=False,
+                                           position=(col2_x, y2), size=24)
+        plotter.add_text("Mesh only", position=(col2_x + 32, y2), font_size=10)
+        y2 += 32
+
+        plotter.add_checkbox_button_widget(_set_mode("surface", 0.35), value=False,
+                                           position=(col2_x, y2), size=24)
+        plotter.add_text("Transparent", position=(col2_x + 32, y2), font_size=10)
+        y2 += 32
+
+        plotter.add_checkbox_button_widget(_set_mode("surface", 1.0), value=True,
+                                           position=(col2_x, y2), size=24)
+        plotter.add_text("Opaque", position=(col2_x + 32, y2), font_size=10)
+        y2 += 32
+
+        def _toggle_edges(flag):
+            state["show_edges"] = flag
+            _rebuild()
+
+        plotter.add_checkbox_button_widget(_toggle_edges, value=False,
+                                           position=(col2_x, y2), size=24)
+        plotter.add_text("Show mesh", position=(col2_x + 32, y2), font_size=10)
+
+        _rebuild()
+        plotter.add_text("Drag the plane widget to slice through the model; "
+                         "left checkboxes toggle regions, right checkboxes "
+                         "set display mode / mesh overlay",
+                         position="upper_edge", font_size=10)
+        plotter.show()
+
+    def show_geom(self):
+        pg.show(self.geom)
+
+    def _build_geometry_2d(self):
+        """
+        The original 2D path: a rectangular World with horizontal layer
+        boundaries (mt.createWorld(layers=...)), CircleAnom/EllipseAnom
+        blocks merged in, a 2D triangular mesh, and resistivity assigned by
+        shapely polygon containment. Unchanged from the pre-3D
+        implementation other than being extracted into its own method (was
+        inline in __init__).
+        """
         self.world = mt.createWorld(start=self.start, end=self.end, worldMarker=True,
                                     layers=[layer.y for layer in self.layers])
         self.geom = self.world
         for i, circle in enumerate(self.Circles):
-            circle.update(name=circle.name, x=circle.x, y=circle.y, r=circle.r, rho=circle.rho,
-                          _c_num=i + 1 + len(self.layers),
-                          _varflag=circle.varflag, _varlims=circle.varlims)
+            # Build the update() kwargs from the anomaly's own param_names
+            # instead of hardcoding x/y/r/rho, so a shape with a different
+            # parameter set (e.g. EllipseAnom's x,y,a,b,theta,rho) can reuse
+            # this same loop.
+            kwargs = {n: getattr(circle, n) for n in self._entity_param_names(circle, ['x', 'y', 'r', 'rho'])}
+            circle.update(name=circle.name, _c_num=i + 1 + len(self.layers),
+                          _varflag=circle.varflag, _varlims=circle.varlims, **kwargs)
             self.geom = mt.mergePLC([self.geom, circle.block])
         pos = np.array(self.scheme.sensorPositions())
         pos_xy = pos[:, 0:2]
@@ -780,7 +1344,6 @@ class AnomalyWorld:
             self.geom.createNode(sen - [0, 0.1])
         self.mesh = mt.createMesh(self.geom, quality=34)
         self.mesh = mt.appendBoundary(self.mesh)
-        self.meas = meas
         # Add the initial layer from 0 to the first layer's y value
         self.layer_resistivities = []
         self.layers_lim = []
@@ -803,30 +1366,236 @@ class AnomalyWorld:
         self.polygon_resistivities = [circle.rho for circle in self.Circles]
         self.resistivity_map = assign_polygon_resistivities(self.mesh, self.polygons, self.polygon_resistivities,
                                                             self.resistivity_map)
-        self.fop = ert.ERTModelling()
-        self.n_fev = 0
-        self.best_male = np.inf
-        self.best_msle = np.inf
-        self.best_x_male = None
-        self.best_x_msle = None
-        self.history = {
-            'fevals': [],
-            'best_male': [],
-            'best_msle': []
-        }
-        
-        self._fev_display = display("", display_id=True)
-    
-    def _geometry_state(self):
-        layer_state = tuple(layer.y for layer in self.layers)
-        circle_state = tuple((c.x, c.y, c.r) for c in self.Circles)
-        return layer_state, circle_state
 
-    def show_mesh(self):
-        pg.show(self.mesh, data=self.resistivity_map)
+    def _layer_z_boundaries(self):
+        """
+        [(z_top, z_bottom), ...] slabs for the 3D layered box, plus the
+        markers to give each slab (and the background below the last
+        layer) a distinct region marker for mt.createCube. z=0 is the
+        surface (self.start[-1]); self.end[-1] is the box floor.
+        """
+        z_top_of_world = self.start[-1]
+        z_bottom_of_world = self.end[-1]
+        boundaries = [z_top_of_world] + [layer.y for layer in self.layers] + [z_bottom_of_world]
+        slabs = list(zip(boundaries[:-1], boundaries[1:]))
+        markers = list(range(1, len(slabs) + 1))
+        return slabs, markers
 
-    def show_geom(self):
-        pg.show(self.geom)
+    def _build_mesh_3d_gmsh(self):
+        """
+        Builds self.mesh with EXACT (conformal) boundaries between layer
+        slabs and CylinderAnom bodies, via gmsh's OCC CSG kernel.
+
+        HISTORY, why this replaced pyGIMLi's own mergePLC/TetGen path: an
+        earlier version built one mt.createCube() slab per layer and
+        mergePLC'd them into a stack of internal horizontal facets. That
+        broke in 3D whenever a CylinderAnom crosses a layer boundary: the
+        cylinder's curved side surface then pierces straight through a flat
+        internal facet without sharing an edge with it, leaving TetGen a
+        self-intersecting PLC it cannot triangulate (a bare TetGen crash,
+        not a Python exception -- terminate called after throwing an
+        instance of 'int' / segfaulting). Root cause: pyGIMLi's mergePLC
+        merges by distance tolerance, not exact boolean intersection, and
+        its own docs say it does not handle crossing/node intersections.
+
+        gmsh's OCC kernel computes an EXACT boolean fragment of the box
+        slabs and cylinders (occ.fragment), so a cylinder crossing a layer
+        boundary is cut cleanly into two conformal sub-volumes with a
+        shared face -- no self-intersection, no TetGen crash. Each
+        resulting fragment volume is classified by (layer_idx, cyl_idx)
+        from its center of mass and tagged with a pyGIMLi-compatible
+        physical-group marker; assign_layer_resistivities_3d /
+        assign_cylinder_resistivities still work fine on this mesh too, and
+        are what _build_geometry_3d/_parse_all_3d call afterwards -- this
+        method only builds the mesh with exact geometry, it does not itself
+        assign resistivities.
+
+        Electrodes are embedded as exact mesh nodes on the domain's flat
+        top face (z=z0, the survey datum) via gmsh.model.mesh.embed, found
+        by bounding-box matching against that face.
+
+        gmsh 4.15 writes MSH format 4.1 by default, which pyGIMLi's
+        readGmsh() cannot parse (UnboundLocalError on 'nodes') -- forced to
+        legacy ASCII v2.2 via Mesh.MshFileVersion before gmsh.write().
+
+        Region marker scheme: self._region_markers maps (layer_idx,
+        cyl_idx) -> integer marker, cyl_idx=None for background-only
+        (no-cylinder) regions in that layer. Verified live: a 1-layer/
+        1-cylinder world produces {(0, None): 1, (0, 0): 2, (1, None): 3,
+        (1, 0): 4}.
+        """
+        import os
+        import tempfile
+        import gmsh
+
+        x0, y0, z0 = self.start
+        x1, y1, z1 = self.end
+        slabs, _ = self._layer_z_boundaries()
+
+        xlo, xhi = min(x0, x1), max(x0, x1)
+        ylo, yhi = min(y0, y1), max(y0, y1)
+        dx, dy = xhi - xlo, yhi - ylo
+
+        gmsh.initialize()
+        try:
+            gmsh.option.setNumber("General.Terminal", 0)
+            gmsh.model.add(f"world3d_{id(self)}")
+            occ = gmsh.model.occ
+
+            box_tags = []
+            for z_top, z_bot in slabs:
+                lo, hi = min(z_top, z_bot), max(z_top, z_bot)
+                box_tags.append(occ.addBox(xlo, ylo, lo, dx, dy, hi - lo))
+
+            cyl_tags = []
+            for cyl in self.Cylinders:
+                a = np.array([cyl.x1, cyl.y1, cyl.z1], dtype=float)
+                b = np.array([cyl.x2, cyl.y2, cyl.z2], dtype=float)
+                axis = b - a
+                cyl_tags.append(occ.addCylinder(
+                    a[0], a[1], a[2], axis[0], axis[1], axis[2], cyl.r))
+
+            # Electrode points are created here and fed into the SAME
+            # occ.fragment() call below as 0D "tool" entities, not embedded
+            # afterwards via a separate gmsh.model.mesh.embed() call. Both
+            # approaches are gmsh-legal, but for a domain this size (tens of
+            # metres) with many small-meshSize electrode points on a face
+            # that's also being split by a fragmenting cylinder, a post-hoc
+            # embed() call was found (empirically, via a real failing 3D
+            # world test) to leave gmsh's 3D tet reconstruction unable to
+            # recover some boundary faces near the electrodes -- it doesn't
+            # raise an exception, just silently emits "No elements in
+            # volume N" and produces a mesh missing that entire region
+            # (which happened to be the whole near-surface layer, so every
+            # electrode ended up off the actual meshed domain --
+            # "There is a requested electrode that does not match the given
+            # mesh." downstream in ert.simulate/invert). Fragmenting the
+            # points in together makes them exact conformal vertices of the
+            # CSG result from the start, matching the pattern in pyGIMLi's
+            # own gmsh CAD-tutorial reference; verified to remove the
+            # failure entirely (0 warnings, all electrodes exact mesh
+            # nodes, real forward solve finite/positive) on this same test
+            # geometry (a shaft that drifts across the first layer
+            # boundary -- the case that triggered the bug).
+            pos = np.array(self.scheme.sensorPositions())
+            elec_pts = []
+            for sen in pos:
+                ex = sen[0]
+                ey = sen[1] if len(sen) > 1 else 0.0
+                elec_pts.append(occ.addPoint(ex, ey, z0, meshSize=self._gmsh_elec_size()))
+
+            occ.synchronize()
+
+            tool_dimtags = [(3, t) for t in cyl_tags] + [(0, p) for p in elec_pts]
+            if tool_dimtags:
+                out, _ = occ.fragment([(3, t) for t in box_tags], tool_dimtags)
+                occ.synchronize()
+            else:
+                out = [(3, t) for t in box_tags]
+            vols = [t for (d, t) in out if d == 3]
+
+            marker_of = {}
+            next_marker = [1]
+            groups = {}
+            for v in vols:
+                cx, cy, cz = occ.getCenterOfMass(3, v)
+                p = np.array([cx, cy, cz])
+
+                layer_idx = len(slabs) - 1
+                for i, (z_top, z_bot) in enumerate(slabs):
+                    lo, hi = min(z_top, z_bot), max(z_top, z_bot)
+                    if lo - 1e-6 <= cz <= hi + 1e-6:
+                        layer_idx = i
+                        break
+
+                cyl_idx = None
+                for i, cyl in enumerate(self.Cylinders):
+                    a = np.array([cyl.x1, cyl.y1, cyl.z1], dtype=float)
+                    b = np.array([cyl.x2, cyl.y2, cyl.z2], dtype=float)
+                    if _point_segment_distance(p, a, b) < cyl.r * 0.9:
+                        cyl_idx = i
+                        break
+
+                key = (layer_idx, cyl_idx)
+                if key not in marker_of:
+                    marker_of[key] = next_marker[0]
+                    next_marker[0] += 1
+                groups.setdefault(marker_of[key], []).append(v)
+
+            for mk, tags in groups.items():
+                pgtag = gmsh.model.addPhysicalGroup(3, tags, mk)
+                gmsh.model.setPhysicalName(3, pgtag, f"region_{mk}")
+            self._region_markers = marker_of
+
+            # Electrodes are already exact conformal vertices of the CSG
+            # result (fragmented in above, alongside the cylinders) -- just
+            # sanity-check each one still exists as a 0D point entity at
+            # its expected position; no further embed() call needed.
+            _pt_tags = {t for (d, t) in gmsh.model.getEntities(0)}
+            missing = [pt for pt in elec_pts if pt not in _pt_tags]
+            if missing:
+                print(f"WARNING: {len(missing)} electrode point(s) did not survive "
+                      f"the CSG fragment as distinct vertices -- check for "
+                      f"electrodes sitting exactly on a cylinder/layer edge.")
+
+            gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
+            gmsh.option.setNumber("Mesh.MeshSizeMax", self._gmsh_max_size())
+            gmsh.option.setNumber("Mesh.MeshSizeMin", self._gmsh_elec_size())
+            gmsh.model.mesh.generate(3)
+
+            fd, msh_path = tempfile.mkstemp(suffix=".msh")
+            os.close(fd)
+            gmsh.write(msh_path)
+        finally:
+            gmsh.finalize()
+
+        self.mesh = mt.readGmsh(msh_path)
+        os.remove(msh_path)
+        self.geom = self.mesh
+
+    def _gmsh_max_size(self):
+        if hasattr(self, 'gmsh_mesh_size_max'):
+            return self.gmsh_mesh_size_max
+        x0, y0, _ = self.start
+        x1, y1, _ = self.end
+        return max(min(abs(x1 - x0), abs(y1 - y0)) / 15.0, 0.5)
+
+    def _gmsh_elec_size(self):
+        if hasattr(self, 'gmsh_mesh_size_min'):
+            return self.gmsh_mesh_size_min
+        if self.Cylinders:
+            return max(min(cyl.r for cyl in self.Cylinders) / 3.0, 0.05)
+        return self._gmsh_max_size() / 6.0
+
+    def _build_geometry_3d(self):
+        """
+        3D counterpart of _build_geometry_2d. Delegates the actual mesh
+        construction to _build_mesh_3d_gmsh (see its docstring for why:
+        exact, conformal layer/cylinder boundaries via gmsh's OCC boolean
+        CSG kernel, replacing an earlier pyGIMLi mergePLC-based approach
+        that could not reliably handle a cylinder crossing a layer
+        boundary). This method just keeps entity bookkeeping (cyl.update)
+        consistent with the 2D path before delegating.
+        """
+        for i, cyl in enumerate(self.Cylinders):
+            kwargs = {n: getattr(cyl, n) for n in self._entity_param_names(
+                cyl, ['x1', 'y1', 'z1', 'x2', 'y2', 'z2', 'r', 'rho'])}
+            cyl.update(name=cyl.name, _c_num=i + 1 + len(self.layers),
+                      _varflag=cyl.varflag, _varlims=cyl.varlims, **kwargs)
+
+        self._build_mesh_3d_gmsh()
+
+        slabs, _ = self._layer_z_boundaries()
+        self.layer_resistivities = [layer.rho for layer in self.layers]
+        self.layers_lim = slabs[:len(self.layers)]
+        self.resistivity_map = assign_layer_resistivities_3d(
+            self.mesh, self.layers_lim, self.layer_resistivities,
+            default_resistivity=self.rho_world)
+
+        cyl_specs = [(c.x1, c.y1, c.z1, c.x2, c.y2, c.z2, c.r) for c in self.Cylinders]
+        cyl_rhos = [c.rho for c in self.Cylinders]
+        self.resistivity_map = assign_cylinder_resistivities(
+            self.mesh, cyl_specs, cyl_rhos, self.resistivity_map)
 
     # def parse_all(self):
     #     for i, layer in enumerate(self.layers):
@@ -884,18 +1653,21 @@ class AnomalyWorld:
                 geometry_changed = True
             # Update last state
             self._last_layers_state[i] = layer.y
-        # for i, layer in enumerate(self.layers):
-        #     if layer.y != self.layers[i].y:  # Assuming you store previous values
-        #         geometry_changed = True
-        #         layer.update(name=layer.name, y=layer.y, rho=layer.rho, cnum=i + 1,
-        #                      _varflag=layer.varflag, _varlims=layer.varlims)
-        for i, circle in enumerate(self.Circles):
-            last_circle = self._last_circles_state[i]
-            if (circle.x, circle.y, circle.r) != last_circle:
+        anomalies = self._anomalies()
+        for i, anomaly in enumerate(anomalies):
+            last_state = self._last_circles_state[i]
+            key = self._geometry_key(anomaly)
+            if key != last_state:
                 geometry_changed = True
                 # Update last state
-                self._last_circles_state[i] = (circle.x, circle.y, circle.r)
-        
+                self._last_circles_state[i] = key
+
+        if self.is_3d:
+            self._parse_all_3d(force_regenerate, geometry_changed)
+        else:
+            self._parse_all_2d(force_regenerate, geometry_changed)
+
+    def _parse_all_2d(self, force_regenerate, geometry_changed):
         if force_regenerate or geometry_changed or not hasattr(self, 'mesh'):
             # Regenerate geometry and mesh only if necessary
             self.world = mt.createWorld(start=self.start, end=self.end, worldMarker=True,
@@ -931,22 +1703,49 @@ class AnomalyWorld:
                                                             self.polygon_resistivities,
                                                             self.resistivity_map)
 
-        # # Update constraints only if needed
-        # a, lb, ub = self.constraint_group.evaluate_constraints(self.variable_map,
-        #                                                        self.parameter_map,
-        #                                                        self.num_variables)
-        # if a.size > 0:
-        #     self.constraints = LinearConstraint(a, lb, ub)
-        # else:
-        #     self.constraints = None
+    def _parse_all_3d(self, force_regenerate, geometry_changed):
+        if force_regenerate or geometry_changed or not hasattr(self, 'mesh'):
+            for cyl in self.Cylinders:
+                cyl.update_block()
+            self._build_mesh_3d_gmsh()
+
+        slabs, _ = self._layer_z_boundaries()
+        self.layers_lim = slabs[:len(self.layers)]
+        self.layer_resistivities = [layer.rho for layer in self.layers]
+        self.resistivity_map = assign_layer_resistivities_3d(
+            self.mesh, self.layers_lim, self.layer_resistivities,
+            default_resistivity=self.rho_world)
+
+        cyl_specs = [(c.x1, c.y1, c.z1, c.x2, c.y2, c.z2, c.r) for c in self.Cylinders]
+        cyl_rhos = [c.rho for c in self.Cylinders]
+        self.resistivity_map = assign_cylinder_resistivities(
+            self.mesh, cyl_specs, cyl_rhos, self.resistivity_map)
 
     def get_varflag_n(self):
         n_var = int(self.rho_world_varflag)
         for layer in self.layers:
             n_var += sum(int(vf) for vf in layer.varflag)
-        for circle in self.Circles:
+        for circle in self._anomalies():
             n_var += sum(int(vf) for vf in circle.varflag)
         return n_var
+
+    @staticmethod
+    def _entity_param_names(entity, default):
+        return getattr(entity, 'param_names', default)
+
+    @staticmethod
+    def _geometry_key(anomaly):
+        """
+        Tuple of the anomaly's geometry-affecting param values (everything
+        but rho, which only changes the resistivity map, not the mesh),
+        used to decide whether parse_all() must rebuild the mesh. Was
+        hardcoded to (x, y, r); generalized so a shape with more geometry
+        params (e.g. an ellipse's x, y, a, b, theta) is tracked correctly
+        instead of silently skipping a mesh rebuild when only its non-(x,y,r)
+        params change.
+        """
+        names = getattr(anomaly, 'param_names', ['x', 'y', 'r', 'rho'])
+        return tuple(getattr(anomaly, n) for n in names if n != 'rho')
 
     def update(self, x):
         if isinstance(x, int):
@@ -954,19 +1753,17 @@ class AnomalyWorld:
                 if self.rho_world_varflag:
                     self.rho_world = 10 ** x
                 for layer in self.layers:
-                    if layer.varflag[0]:
-                        layer.y = x
-                    if layer.varflag[1]:
-                        layer.rho = 10 ** x if layer.log_rho else x
-                for circle in self.Circles:
-                    if circle.varflag[0]:
-                        circle.x = x
-                    if circle.varflag[1]:
-                        circle.y = x
-                    if circle.varflag[2]:
-                        circle.r = 10**x if circle.log_r else x
-                    if circle.varflag[3]:
-                        circle.rho = 10**x if circle.log_rho else x
+                    names = self._entity_param_names(layer, ['y', 'rho'])
+                    for i, name in enumerate(names):
+                        if layer.varflag[i]:
+                            log = layer.log_flags.get(name, False) if hasattr(layer, 'log_flags') else (name == 'rho' and layer.log_rho)
+                            setattr(layer, name, 10 ** x if log else x)
+                for circle in self._anomalies():
+                    names = self._entity_param_names(circle, ['x', 'y', 'r', 'rho'])
+                    for i, name in enumerate(names):
+                        if circle.varflag[i]:
+                            log = circle.log_flags.get(name, False) if hasattr(circle, 'log_flags') else False
+                            setattr(circle, name, 10 ** x if log else x)
                 return None
         if len(x) == self.get_varflag_n():
             idx = 0
@@ -974,25 +1771,21 @@ class AnomalyWorld:
                 self.rho_world = 10 ** x[idx]
                 idx += 1
             for layer in self.layers:
-                if layer.varflag[0]:
-                    layer.y = x[idx]
-                    idx += 1
-                if layer.varflag[1]:
-                    layer.rho = 10**x[idx] if layer.log_rho else x[idx]
-                    idx += 1
-            for circle in self.Circles:
-                if circle.varflag[0]:
-                    circle.x = x[idx]
-                    idx += 1
-                if circle.varflag[1]:
-                    circle.y = x[idx]
-                    idx += 1
-                if circle.varflag[2]:
-                    circle.r = 10**x[idx] if circle.log_r else x[idx]
-                    idx += 1
-                if circle.varflag[3]:
-                    circle.rho = 10**x[idx] if circle.log_rho else x[idx]
-                    idx += 1
+                names = self._entity_param_names(layer, ['y', 'rho'])
+                log_flags = layer.log_flags if hasattr(layer, 'log_flags') else {}
+                for i, name in enumerate(names):
+                    if layer.varflag[i]:
+                        log = log_flags.get(name, False)
+                        setattr(layer, name, 10 ** x[idx] if log else x[idx])
+                        idx += 1
+            for circle in self._anomalies():
+                names = self._entity_param_names(circle, ['x', 'y', 'r', 'rho'])
+                log_flags = circle.log_flags if hasattr(circle, 'log_flags') else {}
+                for i, name in enumerate(names):
+                    if circle.varflag[i]:
+                        log = log_flags.get(name, False)
+                        setattr(circle, name, 10 ** x[idx] if log else x[idx])
+                        idx += 1
         else:
             raise ValueError
         self.parse_all(force_regenerate=False)
@@ -1011,10 +1804,12 @@ class AnomalyWorld:
             ub.append(np.log10(self.rho_world_varlim[1]))
 
         for layer in self.layers:
+            names = self._entity_param_names(layer, ['y', 'rho'])
+            log_flags = layer.log_flags if hasattr(layer, 'log_flags') else {}
             if sum(map(int, layer.varflag)) == 1:
                 for i, v in enumerate(layer.varflag):
                     if v:
-                        if i == 1 and layer.log_rho:
+                        if log_flags.get(names[i], False):
                             lb.append(np.log10(layer.varlims[0]))
                             ub.append(np.log10(layer.varlims[1]))
                         else:
@@ -1024,7 +1819,7 @@ class AnomalyWorld:
                 k = 0
                 for i, v in enumerate(layer.varflag):
                     if v:
-                        if i == 1 and layer.log_rho:
+                        if log_flags.get(names[i], False):
                             lb.append(np.log10(layer.varlims[i][0]))
                             ub.append(np.log10(layer.varlims[i][1]))
                         else:
@@ -1032,14 +1827,13 @@ class AnomalyWorld:
                             ub.append(layer.varlims[k][1])
                         k += 1
 
-        for circle in self.Circles:
+        for circle in self._anomalies():
+            names = self._entity_param_names(circle, ['x', 'y', 'r', 'rho'])
+            log_flags = circle.log_flags if hasattr(circle, 'log_flags') else {}
             if sum(map(int, circle.varflag)) == 1:
                 for i, v in enumerate(circle.varflag):
                     if v:
-                        if i == 2 and circle.log_r:
-                            lb.append(np.log10(circle.varlims[0]))
-                            ub.append(np.log10(circle.varlims[1]))
-                        elif i == 3 and circle.log_rho:
+                        if log_flags.get(names[i], False):
                             lb.append(np.log10(circle.varlims[0]))
                             ub.append(np.log10(circle.varlims[1]))
                         else:
@@ -1048,10 +1842,7 @@ class AnomalyWorld:
             else:
                 for i, v in enumerate(circle.varflag):
                     if v:
-                        if i == 2 and circle.log_r:
-                            lb.append(np.log10(circle.varlims[i][0]))
-                            ub.append(np.log10(circle.varlims[i][1]))
-                        elif i == 3 and circle.log_rho:
+                        if log_flags.get(names[i], False):
                             lb.append(np.log10(circle.varlims[i][0]))
                             ub.append(np.log10(circle.varlims[i][1]))
                         else:
@@ -1080,19 +1871,19 @@ class AnomalyWorld:
         if self.rho_world_varflag:
             x0.append(np.log10(self.rho_world))  # Append since self.rho_world is a single value
         for layer in self.layers:
-            if layer.varflag[0]:
-                x0.append(layer.y)  # Append since layer.y is a single value
-            if layer.varflag[1]:
-                x0.append(np.log10(layer.rho) if layer.log_rho else layer.rho)   # Append since layer.rho is a single value
-        for circle in self.Circles:
-            if circle.varflag[0]:
-                x0.append(circle.x)  # Append since circle.x is a single value
-            if circle.varflag[1]:
-                x0.append(circle.y)  # Append since circle.y is a single value
-            if circle.varflag[2]:
-                x0.append(np.log10(circle.r) if circle.log_r else circle.r)  # Append since circle.r is a single value
-            if circle.varflag[3]:
-                x0.append(np.log10(circle.rho) if circle.log_rho else circle.rho)  # Append since circle.rho is a single value
+            names = self._entity_param_names(layer, ['y', 'rho'])
+            log_flags = layer.log_flags if hasattr(layer, 'log_flags') else {}
+            for i, name in enumerate(names):
+                if layer.varflag[i]:
+                    value = getattr(layer, name)
+                    x0.append(np.log10(value) if log_flags.get(name, False) else value)
+        for circle in self._anomalies():
+            names = self._entity_param_names(circle, ['x', 'y', 'r', 'rho'])
+            log_flags = circle.log_flags if hasattr(circle, 'log_flags') else {}
+            for i, name in enumerate(names):
+                if circle.varflag[i]:
+                    value = getattr(circle, name)
+                    x0.append(np.log10(value) if log_flags.get(name, False) else value)
         return x0  # Ensure the method returns x0
 
     # def get_forward_solution(self, _noise=False, _noise_abs=1e-6):
